@@ -12,21 +12,23 @@ from flask_limiter.util import get_remote_address
 from signals.llm_classifier import classify_with_llm
 from signals.stylometric import analyze_stylometry
 from signals.confidence import compute_confidence
-from audit import init_db, log_submission, get_log
+from signals.label_generator import generate_label
+from audit import init_db, log_submission, get_log, get_submission, update_submission
 
 app = Flask(__name__)
 
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["100 per hour"],
+    default_limits=[],          # no blanket limit; each route sets its own
+    storage_uri="memory://",    # in-process store; swap for Redis in production
 )
 
 init_db()  # ensure audit.db and schema exist before first request
 
 
 @app.route("/submit", methods=["POST"])
-@limiter.limit("10 per minute")
+@limiter.limit("10 per minute;100 per day")
 def submit():
     """
     POST /submit
@@ -70,8 +72,8 @@ def submit():
     # Final score = (llm_score × 0.60) + (stylometric_score × 0.40)
     confidence = compute_confidence(llm_score, stylometric_score)
 
-    # --- Label Generator — stub (Milestone 5) ---
-    label = None  # TODO
+    # --- Label Generator ---
+    label = generate_label(confidence)
 
     # Collect per-signal scores; stylometric_score slots in here in Milestone 4
     attribution = {
@@ -87,7 +89,7 @@ def submit():
         llm_score=llm_score,
         stylometric_score=stylometric_score,
         confidence=confidence,
-        attribution=label,   # string label; None until Milestone 5
+        attribution=label["origin"],  # store plain-text origin in audit DB
         status="classified",
     )
 
@@ -110,6 +112,67 @@ def log():
         { "entries": [ { content_id, creator_id, timestamp, llm_score, ... }, ... ] }
     """
     return jsonify({"entries": get_log()}), 200
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    """
+    POST /appeal
+
+    Expected JSON body:
+        {
+            "content_id":        "<UUID from /submit>",
+            "creator_reasoning": "<written explanation>"
+        }
+
+    Updates the submission status to 'under_review' and records the
+    creator's reasoning in the audit log alongside the original
+    classification decision.
+
+    Returns:
+        200 – appeal received and status updated to 'under_review'
+        400 – missing / empty fields or bad JSON
+        404 – content_id not found
+        409 – an appeal is already pending for this content
+    """
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    missing = [f for f in ("content_id", "creator_reasoning") if f not in data]
+    if missing:
+        return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+    content_id = str(data["content_id"]).strip()
+    creator_reasoning = str(data["creator_reasoning"]).strip()
+
+    if not content_id:
+        return jsonify({"error": "Field 'content_id' must not be empty"}), 400
+    if not creator_reasoning:
+        return jsonify({"error": "Field 'creator_reasoning' must not be empty"}), 400
+
+    # --- Retrieve original submission ---
+    submission = get_submission(content_id)
+    if submission is None:
+        return jsonify({"error": "Content not found"}), 404
+
+    # --- Guard against duplicate appeals ---
+    if submission["status"] == "under_review":
+        return jsonify({"error": "An appeal is already pending for this content"}), 409
+
+    # --- Update status and record appeal reason in Audit Log ---
+    update_submission(
+        content_id,
+        status="under_review",
+        appeal_reason=creator_reasoning,
+    )
+
+    return jsonify({
+        "message": "Appeal received. Your content has been flagged for human review.",
+        "content_id": content_id,
+        "status": "under_review",
+    }), 200
 
 
 if __name__ == "__main__":
