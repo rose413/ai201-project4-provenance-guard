@@ -2,3 +2,4 @@
 .env
 __pycache__
 signals\__pycache__
+audit.db
